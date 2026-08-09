@@ -1,0 +1,26 @@
+# 대용량 대회 데이터 (GitHub 파일 용량 제한 100MB 초과)
+# 대회 페이지에서 open.zip 을 받아 data/ 에 넣을 것
+data/train.csv
+data/trackman_history.csv
+
+# 학습 산출물
+submits/
+output/
+*.joblib
+_sandbox/
+_sb*/
+
+# 파이썬
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# 에디터 / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

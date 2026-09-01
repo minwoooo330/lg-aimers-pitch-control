@@ -1,0 +1,138 @@
+# -*- coding: utf-8 -*-
+"""튜닝 설정 3종 x 3시드(전체 데이터). 9개 망을 하나의 풀로 평균한다."""
+"""NN+sd를 전체 데이터로 학습해 numpy 가중치로 내보낸다 (torch 의존 없음).
+   exp120 결과: 체인 기여 45% 지점 2024 +10.00e-5 / 2022 +11.28e-5 (오늘 최대)."""
+from pathlib import Path
+import time, sys
+import joblib
+import numpy as np, pandas as pd
+import torch, torch.nn as nn
+HERE=Path(__file__).resolve().parent
+sys.path.insert(0,str(HERE))
+from features import add_features
+DATA=HERE/"data"/"train.csv"; OUT=HERE/"submits_common"; PKL=OUT/"nnsd_model.pkl"
+ID,TARGET="row_id","control_success"
+EMB=[("pitcher_id",16),("batter_id",16),("pitcher_team_id",4),("batter_team_id",4),
+     ("base_state",4),("pitcher_hand",2),("batter_hand",2),("top_bottom",2),("game_type",2)]
+EPOCHS=4; BATCH=8192; SEEDS=[42,7,2024]
+RATES=["success_rate","middle_rate","reverse_rate"]; BRATES=["success_rate","middle_rate"]
+
+def end_state(d, upto):
+    s=d[d.season<=upto]
+    if len(s)==0: return None
+    idx=s.groupby("pitcher_id")["asof_pitcher_n"].idxmax(); last=s.loc[idx]
+    t={"n":pd.Series(last.asof_pitcher_n.to_numpy(),index=last.pitcher_id.to_numpy())}
+    for r in RATES: t[r]=pd.Series(last["asof_pitcher_"+r].to_numpy(),index=last.pitcher_id.to_numpy())
+    bi=s.groupby("batter_id")["asof_batter_n"].idxmax(); bl=s.loc[bi]
+    t["b_n"]=pd.Series(bl.asof_batter_n.to_numpy(),index=bl.batter_id.to_numpy())
+    for r in BRATES: t["b_"+r]=pd.Series(bl["asof_batter_"+r].to_numpy(),index=bl.batter_id.to_numpy())
+    return t
+
+def build_tables(df, max_season):
+    return {S: end_state(df, S-1) for S in range(int(df.season.min())+1, max_season+1)}
+
+def add_sd(d, tables):
+    n=d.asof_pitcher_n.to_numpy(np.float64); pid=d.pitcher_id.to_numpy(); seas=d.season.to_numpy()
+    n0=np.full(len(d),np.nan); rr={r:np.full(len(d),np.nan) for r in RATES}
+    bn0=np.full(len(d),np.nan); brr={r:np.full(len(d),np.nan) for r in BRATES}
+    for S,tbl in tables.items():
+        if tbl is None: continue
+        mm=(seas==S)
+        if not mm.any(): continue
+        sub_p=pd.Series(pid[mm]); sub_b=pd.Series(d.batter_id.to_numpy()[mm])
+        n0[mm]=sub_p.map(tbl["n"]).to_numpy(np.float64)
+        for r in RATES: rr[r][mm]=sub_p.map(tbl[r]).to_numpy(np.float64)
+        bn0[mm]=sub_b.map(tbl["b_n"]).to_numpy(np.float64)
+        for r in BRATES: brr[r][mm]=sub_b.map(tbl["b_"+r]).to_numpy(np.float64)
+    dn=n-n0; valid=np.isfinite(dn)&(dn>=20)
+    f=pd.DataFrame(index=d.index)
+    f["sd_logn"]=np.where(valid,np.log1p(np.maximum(dn,0)),np.nan)
+    f["sd_isnew"]=(~np.isfinite(n0)).astype(np.float64)
+    for r in RATES:
+        cur=d["asof_pitcher_"+r].to_numpy(np.float64)
+        with np.errstate(invalid="ignore",divide="ignore"):
+            rate=(cur*n-rr[r]*n0)/dn
+        rate=np.where(valid,np.clip(rate,0,1),np.nan)
+        f["sd_"+r]=rate; f["sd_d_"+r]=np.where(valid,rate-cur,np.nan)
+    bn=d.asof_batter_n.to_numpy(np.float64)
+    bdn=bn-bn0; bvalid=np.isfinite(bdn)&(bdn>=20)
+    f["bat_logn"]=np.where(bvalid,np.log1p(np.maximum(bdn,0)),np.nan)
+    for r in BRATES:
+        cur=d["asof_batter_"+r].to_numpy(np.float64)
+        with np.errstate(invalid="ignore",divide="ignore"):
+            rate=(cur*bn-brr[r]*bn0)/bdn
+        rate=np.where(bvalid,np.clip(rate,0,1),np.nan)
+        f["bat_"+r]=rate; f["bat_d_"+r]=np.where(bvalid,rate-cur,np.nan)
+    return f.fillna(0.0)
+
+class Net(nn.Module):
+    def __init__(self,sizes,ndim,cfg):
+        super().__init__()
+        ed=cfg["emb_dim"]; dims=[ed,ed,4,4,4,2,2,2,2]
+        self.embs=nn.ModuleList([nn.Embedding(s,d) for s,d in zip(sizes,dims)])
+        self.p_same=nn.Embedding(sizes[0],ed); self.p_opp=nn.Embedding(sizes[0],ed)
+        dim=ndim+sum(dims)+ed
+        dr=cfg["dropout"]
+        L=[nn.Linear(dim,cfg["h1"]),nn.ReLU(),nn.Dropout(dr),
+           nn.Linear(cfg["h1"],cfg["h2"]),nn.ReLU(),nn.Dropout(dr)]
+        if cfg.get("h3"): L+=[nn.Linear(cfg["h2"],cfg["h3"]),nn.ReLU(),nn.Dropout(dr),nn.Linear(cfg["h3"],1)]
+        else: L+=[nn.Linear(cfg["h2"],1)]
+        self.mlp=nn.Sequential(*L)
+    def forward(self,xc,xn,sm):
+        e=[emb(xc[:,j]) for j,emb in enumerate(self.embs)]
+        s=sm.unsqueeze(1)
+        ph=self.p_same(xc[:,0])*s+self.p_opp(xc[:,0])*(1-s)
+        return self.mlp(torch.cat(e+[ph,xn],dim=1)).squeeze(1)
+
+
+def main():
+    import json
+    cfgs=json.load(open(HERE/"tuned_nn_configs.json"))
+    t0=time.time()
+    df=pd.read_csv(DATA,encoding="utf-8-sig"); y=df[TARGET].to_numpy(np.float32)
+    TAB=build_tables(df, int(df.season.max())+1)
+    sdfeat=add_sd(df, TAB)
+    cat=np.zeros((len(df),len(EMB)),dtype=np.int64); sizes=[]; vocabs=[]
+    for j,(c,_) in enumerate(EMB):
+        vals=sorted(df[c].dropna().astype(str).unique()); mp={v:i+1 for i,v in enumerate(vals)}
+        cat[:,j]=df[c].astype(str).map(mp).fillna(0).to_numpy(dtype=np.int64)
+        sizes.append(len(vals)+1); vocabs.append(mp)
+    cn={c for c,_ in EMB}
+    num_cols=[c for c in df.columns if c not in cn and c not in (ID,TARGET)]
+    xn=pd.concat([df[num_cols],add_features(df),sdfeat],axis=1).astype(np.float32)
+    feat=list(xn.columns); med=xn.median(); xn=xn.fillna(med)
+    mu,sd=xn.mean(),xn.std().replace(0,1); xn=((xn-mu)/sd).to_numpy(np.float32)
+    same=(df.pitcher_hand.to_numpy()==df.batter_hand.to_numpy()).astype(np.float32)
+    Xc=torch.from_numpy(cat); Xn=torch.from_numpy(xn); Y=torch.from_numpy(y); SM=torch.from_numpy(same)
+    n=len(df); idx=np.arange(n); lossf=nn.BCEWithLogitsLoss()
+    print(f"데이터 {xn.shape} ({time.time()-t0:.0f}s)",flush=True)
+    allnets=[]
+    for name,cfg in cfgs.items():
+        for seed in [42,7,2024]:
+            torch.manual_seed(seed); np.random.seed(seed); tt=time.time()
+            net=Net(sizes,xn.shape[1],cfg)
+            opt=torch.optim.AdamW(net.parameters(),lr=cfg["lr"],weight_decay=cfg["wd"])
+            B=cfg["batch"]; EP=cfg["epochs"]
+            sched=torch.optim.lr_scheduler.CosineAnnealingLR(opt,T_max=EP*((n+B-1)//B)) if cfg["cos"] else None
+            for ep in range(EP):
+                np.random.shuffle(idx); net.train()
+                for st in range(0,n,B):
+                    bb=idx[st:st+B]; opt.zero_grad()
+                    lossf(net(Xc[bb],Xn[bb],SM[bb]),Y[bb]).backward(); opt.step()
+                    if sched: sched.step()
+            net.eval(); L=net.mlp
+            w={"emb":[e.weight.detach().numpy().astype(np.float32) for e in net.embs],
+               "p_same":net.p_same.weight.detach().numpy().astype(np.float32),
+               "p_opp":net.p_opp.weight.detach().numpy().astype(np.float32),
+               "dims":[e.weight.shape[1] for e in net.embs]}
+            li=[m for m in L if isinstance(m,nn.Linear)]
+            for k,lay in enumerate(li):
+                w[f"W{k+1}"]=lay.weight.detach().numpy(); w[f"b{k+1}"]=lay.bias.detach().numpy()
+            w["n_layers"]=len(li)
+            allnets.append(w)
+            print(f"  {name} seed {seed} {time.time()-tt:.0f}s",flush=True)
+    joblib.dump({"nets":allnets,"vocabs":vocabs,"emb_cols":[c for c,_ in EMB],
+        "num_cols":num_cols,"feat_names":feat,"med":med.to_dict(),
+        "mu":mu.to_dict(),"sd":sd.to_dict(),"tables":TAB},OUT/"nntuned_model.pkl",compress=3)
+    print("nntuned pkl 저장 완료",round(time.time()-t0,1),"s")
+if __name__=="__main__": main()

@@ -1,0 +1,78 @@
+# -*- coding: utf-8 -*-
+"""실험 38: NN 용량 확장 화면 (2024만). 512-256, 8에폭 감쇠, 3시드 평균 고정."""
+from pathlib import Path
+import gc, time
+import numpy as np, pandas as pd
+import torch, torch.nn as nn
+from sklearn.metrics import brier_score_loss, roc_auc_score
+from features import add_features
+
+HERE=Path(__file__).resolve().parent; DATA=HERE/"data"/"train.csv"; RES=HERE/"results"
+ID,TARGET="row_id","control_success"
+EMB=[("pitcher_id",24),("batter_id",24),("pitcher_team_id",4),("batter_team_id",4),
+     ("base_state",4),("pitcher_hand",2),("batter_hand",2),("top_bottom",2),("game_type",2)]
+BATCH=8192
+
+def prep(df,year):
+    tr=df[df.season<year].reset_index(drop=True); va=df[df.season==year].reset_index(drop=True)
+    cat_tr=np.zeros((len(tr),len(EMB)),dtype=np.int64); cat_va=np.zeros((len(va),len(EMB)),dtype=np.int64)
+    sizes=[]
+    for j,(c,_) in enumerate(EMB):
+        vals=sorted(tr[c].dropna().astype(str).unique()); mp={v:i+1 for i,v in enumerate(vals)}
+        cat_tr[:,j]=tr[c].astype(str).map(mp).fillna(0).to_numpy(dtype=np.int64)
+        cat_va[:,j]=va[c].astype(str).map(mp).fillna(0).to_numpy(dtype=np.int64)
+        sizes.append(len(vals)+1)
+    cat_names={c for c,_ in EMB}
+    num_cols=[c for c in df.columns if c not in cat_names and c not in (ID,TARGET)]
+    xn_tr=pd.concat([tr[num_cols],add_features(tr)],axis=1).astype(np.float32)
+    xn_va=pd.concat([va[num_cols],add_features(va)],axis=1).astype(np.float32)
+    med=xn_tr.median(); xn_tr=xn_tr.fillna(med); xn_va=xn_va.fillna(med)
+    mu,sd=xn_tr.mean(),xn_tr.std().replace(0,1)
+    return (cat_tr,((xn_tr-mu)/sd).to_numpy(np.float32),tr[TARGET].to_numpy(np.float32),
+            cat_va,((xn_va-mu)/sd).to_numpy(np.float32),va[TARGET].to_numpy(np.float32),sizes,va[ID].to_numpy())
+
+def train_one(sizes,cat_tr,xn_tr,ytr,cat_va,xn_va,seed):
+    torch.manual_seed(seed); np.random.seed(seed)
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embs=nn.ModuleList([nn.Embedding(s,d) for s,(_,d) in zip(sizes,EMB)])
+            dim=xn_tr.shape[1]+sum(d for _,d in EMB)
+            self.mlp=nn.Sequential(nn.Linear(dim,512),nn.ReLU(),nn.Dropout(0.2),
+                                   nn.Linear(512,256),nn.ReLU(),nn.Dropout(0.2),
+                                   nn.Linear(256,1))
+        def forward(self,xc,xn):
+            e=[emb(xc[:,j]) for j,emb in enumerate(self.embs)]
+            return self.mlp(torch.cat(e+[xn],dim=1)).squeeze(1)
+    net=Net(); lossf=nn.BCEWithLogitsLoss()
+    Xc=torch.from_numpy(cat_tr); Xn=torch.from_numpy(xn_tr); Y=torch.from_numpy(ytr)
+    Vc=torch.from_numpy(cat_va); Vn=torch.from_numpy(xn_va)
+    n=len(ytr); idx=np.arange(n)
+    for ep in range(8):
+        lr=2e-3 if ep<4 else 5e-4
+        opt=torch.optim.AdamW(net.parameters(),lr=lr,weight_decay=1e-5)
+        np.random.shuffle(idx); net.train()
+        for s in range(0,n,BATCH):
+            b=idx[s:s+BATCH]; opt.zero_grad()
+            lossf(net(Xc[b],Xn[b]),Y[b]).backward(); opt.step()
+    net.eval(); ps=[]
+    with torch.no_grad():
+        for s in range(0,len(cat_va),65536):
+            ps.append(torch.sigmoid(net(Vc[s:s+65536],Vn[s:s+65536])).numpy())
+    return np.concatenate(ps)
+
+def main():
+    t0=time.time(); df=pd.read_csv(DATA,encoding="utf-8-sig")
+    cat_tr,xn_tr,ytr,cat_va,xn_va,yva,sizes,ids=prep(df,2024)
+    ps=[]
+    for seed in [42,7,2024]:
+        p=train_one(sizes,cat_tr,xn_tr,ytr,cat_va,xn_va,seed)
+        print({"seed":seed,"brier":brier_score_loss(yva,p)},flush=True); ps.append(p); gc.collect()
+    avg=np.mean(ps,axis=0)
+    print({"seed":"avg","brier":brier_score_loss(yva,avg),"auc":roc_auc_score(yva,avg)},flush=True)
+    pd.DataFrame({ID:ids,"season":2024,TARGET:yva.astype(np.int8),"prediction":avg}).to_csv(
+        RES/"exp38_nn_big_2024_oof.csv.gz",index=False,compression="gzip")
+    print("참고: 기존 NN 3시드평균 2024 = 0.248377")
+    print(f"total={time.time()-t0:.1f}s")
+
+if __name__=="__main__": main()

@@ -1,0 +1,2 @@
+﻿train_rows,valid_rows,exact_games,asof_mix_logloss,model_logloss,logloss_gain,asof_mix_accuracy,model_accuracy,fit_seconds,pass_threshold
+620449,146679,2581,1.0159997844785544,0.9287921883898677,0.08720759608868678,0.49651279324238645,0.5244649881714493,23.23466396331787,True

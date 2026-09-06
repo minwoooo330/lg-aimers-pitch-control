@@ -82,10 +82,10 @@ src/               최종 파이프라인 (제출 추론 script.py + 배포 학�
 experiments/       실험 스크립트 200여 개 (exp01~exp168, eval/diag 유틸)
 results/           실험 수치 결과 csv
 docs/
-  EXPERIMENT_LOG.md   실험 전체 기록 (일지, 판정 근거 포함)
   PIPELINE_GUIDE.md   최종 파이프라인 구조·실행 가이드
   LEDGER.md           보류/기각 대장
   fresh_*.md          백지 재구축 세션 문서 (편향 검증용 독립 재구축, 추정 730~760점)
+  fresh_TRIED.md      시도했다가 기각한 것들의 사실 기록
 fresh_rebuild/     백지 재구축 세션 코드
 submits/           제출본 SHA-256 이력
 data/              (비어 있음 — 공식 데이터·베이스라인은 대회 페이지 open.zip에서 받을 것)
